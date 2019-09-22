@@ -1,0 +1,79 @@
+version: "3.7"
+
+services:
+
+  keycloak-setup:
+    image: docker/compose:1.24.1
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: ./docker-compose.yml
+        target: /docker-compose.yml
+      - type: bind
+        source: ./.env
+        target: /.env
+    entrypoint: ""
+    command:
+      - /bin/sh
+      - -ce
+      - |
+        docker-compose ps
+        echo "wait for precondition..."
+        ( docker-compose logs --follow --tail 2 keycloak & ) | grep -q 'Admin console listening'
+        echo "precondition matched, continue..."
+
+        echo "keycloak server state"
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/jboss-cli.sh --connect --command=":read-attribute(name=server-state)"
+
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh config credentials --server http://localhost:8080/auth --realm master --user admin --password admin
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh create realms -s realm=demorealm -s enabled=true
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh create roles -r demorealm -s name=user -s 'description=Regular user with limited set of permissions'
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh create clients -r demorealm -s clientId=myapp -s enabled=true -s publicClient=true -s 'redirectUris=["http://localhost:8080/*"]' -s 'webOrigins=["http://localhost:8080"]'
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh create users -r demorealm -s username=testuser -s enabled=true
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh set-password -r demorealm --username testuser --new-password testuser
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh add-roles -r demorealm --uusername testuser --rolename user
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh create clients -r demorealm -s clientId=mybackend -s enabled=true -s serviceAccountsEnabled=true -s clientAuthenticatorType=client-secret -s secret=d0b8122f-8dfb-46b7-b68a-f5cc4e25d000
+
+        echo "docker-compose service 'keycloak-setup' finished."
+    depends_on:
+      - keycloak
+
+  keycloak-setup-details:
+    image: docker/compose:1.24.1
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: ./docker-compose.yml
+        target: /docker-compose.yml
+      - type: bind
+        source: ./docker-compose.setup.keycloak.yml
+        target: /docker-compose.setup.keycloak.yml
+      - type: bind
+        source: ./.env
+        target: /.env
+    entrypoint: ""
+    command:
+      - /bin/sh
+      - -ce
+      - |
+        apk --no-cache add jq
+
+        docker-compose -f docker-compose.yml -f docker-compose.setup.keycloak.yml ps
+        echo "wait for precondition..."
+        ( docker-compose -f docker-compose.yml -f docker-compose.setup.keycloak.yml logs --follow --tail 2 keycloak-setup & ) | grep -q "docker-compose service 'keycloak-setup' finished."
+        echo "precondition matched, continue..."
+
+        echo "keycloak server state"
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/jboss-cli.sh --connect --command=":read-attribute(name=server-state)"
+
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh config credentials --server http://localhost:8080/auth --realm master --user admin --password admin
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh get clients -r demorealm --fields id,clientId | jq 'map(select(.clientId == "myapp")) | .[].id' | awk '{system("docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh get clients/"$$1"/installation/providers/keycloak-oidc-keycloak-json -r demorealm")}' | jq
+        docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh get clients -r demorealm --fields id,clientId | jq 'map(select(.clientId == "mybackend")) | .[].id' | awk '{system("docker-compose exec -T keycloak /opt/jboss/keycloak/bin/kcadm.sh get clients/"$$1"/installation/providers/keycloak-oidc-keycloak-json -r demorealm")}' | jq
+
+        echo "docker-compose service 'keycloak-setup-details' finished."
+    depends_on:
+      - keycloak-setup

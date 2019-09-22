@@ -1,0 +1,60 @@
+version: "3.7"
+
+services:
+  
+  postgres:
+    image: postgres
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: password
+    expose:
+      - "5432"
+    ports:
+      - "5432:5432"
+
+  keycloak:
+    image: jboss/keycloak:7.0.0
+    environment:
+      DB_VENDOR: POSTGRES
+      DB_ADDR: postgres
+      DB_DATABASE: keycloak
+      DB_USER: keycloak
+      DB_SCHEMA: public
+      DB_PASSWORD: password
+      KEYCLOAK_USER: admin
+      KEYCLOAK_PASSWORD: admin
+      PROXY_ADDRESS_FORWARDING: "true"
+      # Uncomment the line below if you want to specify JDBC parameters. The parameter below is just an example, and it shouldn't be used in production without knowledge. It is highly recommended that you read the PostgreSQL JDBC driver documentation in order to use it.
+      #JDBC_PARAMS: "ssl=true"
+    expose:
+      - "8080"
+    ports:
+      - 8081:8080
+    depends_on:
+      - postgres
+
+  wildfly:
+    image: jboss/wildfly:17.0.1.Final
+    volumes:
+      - type: bind
+        source: ./deployments
+        target: /opt/jboss/wildfly/standalone/deployments
+    expose:
+      - "8080"
+      - "8787"
+      - "9990"
+    ports:
+      - 8082:8080
+      - 8787:8787
+      - 9992:9990
+    command:
+      - "/opt/jboss/wildfly/bin/standalone.sh"
+      - "-b"
+      - "0.0.0.0"
+      - "-bmanagement"
+      - "0.0.0.0"
+      - "--debug"
+      - "*:8787"
+    depends_on:
+      - postgres

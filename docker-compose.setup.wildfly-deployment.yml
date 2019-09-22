@@ -1,0 +1,65 @@
+version: "3.7"
+
+services:
+
+  wildfly-deployment-postgres-setup:
+    image: postgres
+    volumes:
+      - type: bind
+        source: ./postgresql
+        target: /postgresql
+    entrypoint: ""
+    command:
+      - /bin/bash
+      - -c
+      - |
+        until pg_isready -h postgres -p 5432
+        do
+          echo "Waiting for postgres"
+          sleep 2;
+        done
+
+        PGPASSWORD=password psql -h postgres -p 5432 -d postgres -U keycloak -c "SELECT 1;"
+
+        PGPASSWORD=password psql -h postgres -p 5432 -d postgres -U keycloak < /postgresql/init-postgres.sql
+        PGPASSWORD=mytenant psql -h postgres -p 5432 -d mydb -U mytenant -c "SELECT 1;"
+
+        PGPASSWORD=password psql -h postgres -p 5432 -d postgres -U keycloak < /postgresql/init-postgres-hibernatedemodb.sql
+        PGPASSWORD=hibernatedemo psql -h postgres -p 5432 -d hibernatedemodb -U hibernatedemo -c "SELECT 1;"
+    depends_on:
+      - postgres
+
+  wildfly-deployment-setup:
+    image: docker/compose:1.24.1
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: ./docker-compose.yml
+        target: /docker-compose.yml
+      - type: bind
+        source: ./docker-compose.setup.wildfly.yml
+        target: /docker-compose.setup.wildfly.yml
+      - type: bind
+        source: ./.env
+        target: /.env
+    entrypoint: ""
+    command:
+      - /bin/sh
+      - -ce
+      - |
+        docker-compose -f docker-compose.yml -f docker-compose.setup.wildfly.yml ps
+        echo "wait for precondition..."
+        ( docker-compose -f docker-compose.yml -f docker-compose.setup.wildfly.yml logs --follow --tail 2 wildfly-setup & ) | grep -q "docker-compose service 'wildfly-setup' finished."
+        echo "precondition matched, continue..."
+
+        echo "wildfly server state"
+        docker-compose exec -T wildfly /opt/jboss/wildfly/bin/jboss-cli.sh --connect --command=":read-attribute(name=server-state)"
+
+        echo "add data-sources"
+        docker-compose exec -T wildfly /opt/jboss/wildfly/bin/jboss-cli.sh --connect --command="data-source add --name=HibernateQuickstartDS --jndi-name=java:jboss/datasources/HibernateQuickstartDS --driver-name=postgres --connection-url=jdbc:postgresql://postgres:5432/hibernatedemodb --user-name=hibernatedemo --password=hibernatedemo /subsystem=datasources/jdbc-driver=postgres:add(driver-name=postgres,driver-module-name=org.postgresql.jdbc,driver-class-name=org.postgresql.Driver,driver-xa-datasource-class-name=org.postgresql.xa.PGXADataSource)"
+
+        echo "docker-compose service 'wildfly-deployment-setup' finished."
+    depends_on:
+      - wildfly-setup
