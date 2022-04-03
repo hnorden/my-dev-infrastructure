@@ -1,0 +1,144 @@
+version: 3
+
+vars:
+  vars:
+  DB_HOST: localhost
+  DB_PORT: 5432
+  DB_SERVER: -h {{.DB_HOST}} -p {{.DB_PORT}}
+  SH_COMMAND: /bin/sh # docker-compose exec -T postgres /bin/sh
+
+tasks:
+  _service-status: brew services info postgresql
+
+  run:
+    desc: Start postgres
+    deps: [_service-status]
+    cmds:
+      - brew services restart postgresql
+  
+  _is-ready:
+    # run: once
+    cmds:
+      - |
+        cat << EOF | {{.SH_COMMAND}}
+        until pg_isready {{.DB_SERVER}}
+        do
+          echo "Waiting for postgres"
+          sleep 2;
+        done
+        EOF
+
+  _health:
+    deps: [_is-ready]
+    cmds:
+      - psql {{.DB_SERVER}} -d postgres -U postgres -c "SELECT 1;"
+
+  _users:
+    cmds:
+      - psql {{.DB_SERVER}} -d postgres -U postgres -c "select * from pg_catalog.pg_user;"
+      - psql {{.DB_SERVER}} -d postgres -U postgres -c "\du+ *"
+      - psql {{.DB_SERVER}} -d postgres -U postgres -c "\dg+ *"
+  
+  psql:
+    desc: Connect with psql 
+    cmds:
+      - PGPASSWORD=mytenant psql {{.DB_SERVER}} -d mydb -U mytenant
+    interactive: true
+  
+  psql-with-args:
+    desc: |-
+      Connect with psql and execute query.
+        $ task {{.TASK}} -- -c "SELECT 1";
+    cmds:
+      - PGPASSWORD=mytenant psql {{.DB_SERVER}} -d mydb -U mytenant {{.CLI_ARGS}}
+    interactive: true
+
+  logs:
+    desc: Follow log file
+    cmds:
+      - tail -f /usr/local/var/log/postgres.log | bat --paging=never --language log
+    interactive: true
+
+  _config: pg_config
+
+  setup:
+    desc: Setup the started etcd
+    cmds:
+      - task: _provision:databases
+      - task: _provision:databases:with-template
+
+  _provision:databases:
+    deps: [_health]
+    cmds:
+      - |
+        cat << EOF | {{.SH_COMMAND}}
+        PGPASSWORD=password psql {{.DB_SERVER}} -d postgres -U keycloak -c "SELECT 1;"
+
+        PGPASSWORD=password psql {{.DB_SERVER}} -d postgres -U keycloak < /postgresql/init-postgres.sql
+        PGPASSWORD=mytenant psql {{.DB_SERVER}} -d mydb -U mytenant -c "SELECT 1;"
+
+        PGPASSWORD=password psql {{.DB_SERVER}} -d postgres -U keycloak < /postgresql/init-postgres-hibernatedemodb.sql
+        PGPASSWORD=hibernatedemo psql {{.DB_SERVER}} -d hibernatedemodb -U hibernatedemo -c "SELECT 1;"
+        EOF
+
+  _provision:databases:with-template:
+    deps: [_health]
+    vars:
+      PG_DATABASE: postgres
+      DB_ROOT_USER: postgres
+      DB_ROOT_PASSWORD: password
+      DATABASES: |-
+        mydb
+        hibernatedemodb
+      TENANT: mytenant
+    cmds:
+      - |
+        cat << EOF | {{.SH_COMMAND}}
+        {{range $i, $line := .DATABASES | splitLines -}}
+
+          PGPASSWORD={{$.DB_ROOT_PASSWORD}} psql {{$.DB_SERVER}} -d {{$.PG_DATABASE}} -U {{$.DB_ROOT_USER}} << EOF_INNER
+          DROP DATABASE IF EXISTS {{$line}};
+          DROP USER IF EXISTS {{$.TENANT}};
+          DROP USER IF EXISTS {{$line}};
+
+          CREATE USER {{$.TENANT}} WITH PASSWORD '{{$.TENANT}}';
+          CREATE USER {{$line}} WITH PASSWORD '{{$line}}';
+          CREATE DATABASE {{$line}} WITH OWNER {{$line}} ENCODING 'UTF-8';
+
+          \c {{$line}};
+          DROP SCHEMA IF EXISTS {{$.TENANT}};
+          CREATE SCHEMA {{$.TENANT}} AUTHORIZATION {{$.TENANT}};
+          GRANT {{$.TENANT}} TO {{$line}}
+        EOF_INNER
+
+          PGPASSWORD={{$line}} psql {{$.DB_SERVER}} -d {{$line}} -U {{$line}} -c "SELECT 1;"
+          PGPASSWORD={{$.TENANT}} psql {{$.DB_SERVER}} -d {{$line}} -U {{$.TENANT}} -c "SELECT 1;"
+
+        {{end}}
+        EOF
+
+  ssh-remote-tunnel:
+    desc: Open a ssh tunnel to remote postgres instance
+    cmds:
+      - ssh hnorden@postgres.mydomain.de -L 5433:localhost:5432 -o ExitOnForwardFailure=yes -v
+    interactive: true
+
+  import:remote-dump:
+    desc: Import dump from remote postgres instance
+    deps: [_health]
+    vars:
+      REMOTE_DB_HOST: localhost # host.docker.internal
+      REMOTE_DB_PORT: 5433
+      REMOTE_DB_SERVER: -h {{.REMOTE_DB_HOST}} -p {{.REMOTE_DB_PORT}}
+      DATABASE: mydb
+      DB_USER: mytenant
+      DB_PASSWORD: mytenant
+    cmds:
+      - |
+        cat << EOF | {{.SH_COMMAND}}
+        PGPASSWORD={{.DB_PASSWORD}} psql {{.DB_SERVER}} -d {{.DATABASE}} -U {{.DB_USER}} -c "SELECT 1;"
+        PGPASSWORD={{.DB_PASSWORD}} psql {{.REMOTE_DB_SERVER}} -d {{.DATABASE}} -U {{.DB_USER}} -c "SELECT 1;"
+        PGPASSWORD={{.DB_PASSWORD}} pg_dump {{.REMOTE_DB_SERVER}} -d {{.DATABASE}} --schema {{.DB_USER}} \
+          --create --clean --exclude-table xxx -U {{.DB_USER}} | \
+          PGPASSWORD={{.DB_PASSWORD}} psql {{.DB_SERVER}} -d {{.DATABASE}} -U {{.DB_USER}} 
+        EOF

@@ -1,0 +1,79 @@
+version: 3
+
+# https://etcd.io/docs/v3.5/op-guide/authentication/rbac/
+
+vars:
+  ETCD_USER: root
+  ETCD_PASSWORD: password
+  ETCD_AUTH: --user={{.ETCD_USER}}:{{.ETCD_PASSWORD}}
+  ETCD_ENDPOINTS: --endpoints=http://localhost:2379
+  ETCD_PARAMS: "{{.ETCD_AUTH}} {{.ETCD_ENDPOINTS}}"
+  SH_COMMAND: /bin/sh # docker-compose exec -T etcd-1 /bin/sh
+
+tasks:
+  _service-status: brew services info etcd
+
+  run:
+    desc: Start etcd
+    deps: [_service-status]
+    cmds:
+      - brew services restart etcd
+
+  _health: '{{.SH_COMMAND}} -c "ETCDCTL_API=3 etcdctl endpoint health"'
+
+  _health-with-auth: '{{.SH_COMMAND}} -c "ETCDCTL_API=3 etcdctl {{.ETCD_PARAMS}} endpoint health"'
+
+  setup:
+    desc: Setup the started etcd
+    cmds:
+      - task: _user:add
+      - task: _auth:enable
+      - task: import:tenant-configs
+
+  _user:add:
+    deps: [_health]
+    cmds:
+      - |
+        cat << EOF | {{.SH_COMMAND}}
+        export ETCDCTL_API=3
+        # etcdctl --help
+        # etcdctl user get {{.ETCD_USER}}
+        # etcdctl role list
+        # etcdctl user list
+        # echo "{{.ETCD_PASSWORD}}" | etcdctl user add {{.ETCD_USER}} --interactive=false
+        etcdctl user add {{.ETCD_USER}}:{{.ETCD_PASSWORD}}
+        EOF
+
+  _user:change-password: echo "password" | {{.SH_COMMAND}} -c "ETCDCTL_API=3 etcdctl {{.ETCD_PARAMS}} user passwd {{.ETCD_USER}} --interactive=false"
+  
+  _auth:enable: '{{.SH_COMMAND}} -c "ETCDCTL_API=3 etcdctl {{.ETCD_ENDPOINTS}} auth enable"'
+
+  _auth:disable: '{{.SH_COMMAND}} -c "ETCDCTL_API=3 etcdctl {{.ETCD_PARAMS}} auth disable"'
+
+  etcd:get-all:
+    desc: List all etcd entries
+    cmds:
+      - '{{.SH_COMMAND}} -c "ETCDCTL_API=3 etcdctl {{.ETCD_PARAMS}} get --prefix \"\" "'
+
+  import:tenant-configs:
+    desc: Import tenant configs from remote etcd instance
+    deps: [_health-with-auth]
+    vars:
+      REMOTE_ETCD_USER: root
+      REMOTE_ETCD_PASSWORD: password
+      REMOTE_ETCD_AUTH: --user={{.REMOTE_ETCD_USER}}:{{.REMOTE_ETCD_PASSWORD}}
+      REMOTE_ETCD_ENDPOINTS: --endpoints=http://localhost:2379
+      REMOTE_ETCD_PARAMS: "{{.REMOTE_ETCD_AUTH}} {{.REMOTE_ETCD_ENDPOINTS}}"
+      TENANT: mytenant
+      KEY_PREFIXES: |-
+        config
+        toggle
+    cmds:
+      - |
+        cat << EOF | {{.SH_COMMAND}}
+        {{range $i, $line := .KEY_PREFIXES | splitLines -}}
+          # --cacert xxx.pem
+          # --debug
+          ETCDCTL_API=3 etcdctl {{$.REMOTE_ETCD_PARAMS}} get --prefix "{{$line}}.{{$.TENANT}}." | awk -v etcdParams="{{$.ETCD_PARAMS}}" -f etcd-stream-converter.awk --
+        {{end}}
+        EOF

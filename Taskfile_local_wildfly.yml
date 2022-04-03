@@ -1,0 +1,273 @@
+version: 3
+
+### Note for heredocs
+# 'EOF' prevent variable intepretation
+# https://stackoverflow.com/questions/2953081/how-can-i-write-a-heredoc-to-a-file-in-bash-script
+# If you don't want to interpret variables in the text, then use single quotes
+# https://www.howtogeek.com/719058/how-to-use-here-documents-in-bash-on-linux/
+
+vars:
+  KEYCLOAK_VERSION: 15.1.1
+  POSTGRES_VERSION: 42.2.24
+  WILDFLY_VERSION: 26.0.1.Final
+  WILDFLY_HOMES: ./wildfly_homes
+  WILDFLY_HOME: "{{.WILDFLY_HOMES}}/wildfly-{{.WILDFLY_VERSION}}"
+  JBOSS_CLI: "{{.WILDFLY_HOME}}/bin/jboss-cli.sh" # docker-compose exec -T wildfly /opt/jboss/wildfly/bin/jboss-cli.sh
+  WILDFLY_STANDALONE: "{{.WILDFLY_HOME}}/bin/standalone.sh"
+  WILDFLY_DEPLOYMENTS: "{{.WILDFLY_HOME}}/standalone/deployments"
+
+tasks:
+  _download:wildfly:
+    cmds:
+      - |
+        mkdir -p {{.WILDFLY_HOMES}}
+        cd {{.WILDFLY_HOMES}}
+        if [ ! -f wildfly-{{.WILDFLY_VERSION}}.tar.gz ]
+        then
+          curl -L https://github.com/wildfly/wildfly/releases/download/{{.WILDFLY_VERSION}}/wildfly-{{.WILDFLY_VERSION}}.tar.gz -O
+        fi
+  
+  _install:wildfly:
+    deps: [_download:wildfly]
+    cmds:
+      - |
+        if [ ! -d {{.WILDFLY_HOME}} ]
+        then
+          cd {{.WILDFLY_HOMES}}
+          tar zxf wildfly-{{.WILDFLY_VERSION}}.tar.gz
+        fi
+
+  run:
+    desc: Start wildfly
+    deps: [_install:wildfly]
+    cmds:
+      - "{{.WILDFLY_STANDALONE}} --server-config=standalone.xml -b 0.0.0.0 -bmanagement 0.0.0.0 --debug *:8787"
+
+
+
+
+  clean:
+    desc: Start over - delete wildfly directory {{.WILDFLY_HOME}}
+    cmds:
+      - rm -rf {{.WILDFLY_HOME}}
+
+  setup:
+    desc: Setup the started wildfly
+    cmds:
+      - task: _update-repos
+      - task: _provision:wildfly
+      - task: _configure:widfly
+
+
+
+
+  _provision:wildfly:
+    cmds:
+      - task: _provision:keycloak-adapter
+      - task: _provision:postgres-adapter
+      - task: _provision:artemis:subsystem:init
+      - task: _provision:artemis:subsystem:ee:ejb3:naming
+      - task: _provision:artemis:subsystem:local
+
+  _configure:widfly:
+    cmds:
+      - task: _configure:logging
+      - task: _configure:datasources
+
+
+
+
+  _download:keycloak-adapter:
+    dir: "{{.WILDFLY_HOMES}}"
+    cmds:
+      - echo "If required, download keycloak adapter version {{.KEYCLOAK_VERSION}}"
+      - |
+        if [ ! -f keycloak-oidc-wildfly-adapter-{{.KEYCLOAK_VERSION}}.tar.gz ]
+        then
+          curl -L https://github.com/keycloak/keycloak/releases/download/{{.KEYCLOAK_VERSION}}/keycloak-oidc-wildfly-adapter-{{.KEYCLOAK_VERSION}}.tar.gz -O
+        fi
+
+  _install:keycloak-adapter:
+    deps: [_download:keycloak-adapter]
+    dir: "{{.WILDFLY_HOME}}"
+    cmds:
+      - echo "Install keycloak adapter {{.KEYCLOAK_VERSION}}"
+      - |
+        tar zxf ../keycloak-oidc-wildfly-adapter-{{.KEYCLOAK_VERSION}}.tar.gz
+        cp -a modules/system/add-ons/keycloak/org/keycloak modules/system/layers/base/org/
+
+  _provision:keycloak-adapter:
+    deps:  [_install:keycloak-adapter]
+    cmds:
+      - "{{.JBOSS_CLI}} --connect --file={{.WILDFLY_HOME}}/bin/adapter-elytron-install.cli"
+      - task: _provision:remove-elytron-config
+
+  _provision:remove-elytron-config:
+    cmds:
+      - echo "Apply workaroud to enable keycloak instead of OIDC in wildfly 26"
+      - |
+        {{.JBOSS_CLI}} --connect << EOF
+        batch
+        /subsystem=undertow/application-security-domain=other:undefine-attribute(name=security-domain)
+        /subsystem=undertow/application-security-domain=other:write-attribute(name=http-authentication-factory,value=keycloak-http-authentication)
+        /subsystem=ejb3/application-security-domain=other:write-attribute(name=security-domain,value=KeycloakDomain)
+        run-batch
+        # remove elytron-oidc-client subsystem as securityContext would not provide UserPrincipal (securityContext.getUserPrincipal() == null)
+        /subsystem=elytron-oidc-client:remove
+        EOF
+
+
+
+
+  _download:postgres-adapter:
+    dir: "{{.WILDFLY_HOMES}}"
+    cmds:
+      - echo "If required, download postgres module version {{.POSTGRES_VERSION}}"
+      - |
+        if [ ! -f postgresql-{{.POSTGRES_VERSION}}.jar ]
+        then
+          curl -L https://jdbc.postgresql.org/download/postgresql-{{.POSTGRES_VERSION}}.jar -O
+        fi
+
+  _provision:postgres-adapter:
+    deps: [_download:postgres-adapter]
+    cmds:
+      - |
+        {{.JBOSS_CLI}} --connect << EOF
+        # Add PostgreSQL module (generate modules/org/postgresql/jdbc/main/module.xml)
+        module add --name=org.postgresql.jdbc --resources={{.WILDFLY_HOMES}}/postgresql-{{.POSTGRES_VERSION}}.jar --dependencies=javax.api,javax.transaction.api
+        # Add PostgreSQL driver (to standalone.xml)
+        /subsystem=datasources/jdbc-driver=postgres:add(driver-name="postgres",driver-module-name="org.postgresql.jdbc",driver-class-name=org.postgresql.Driver,driver-xa-datasource-class-name=org.postgresql.xa.PGXADataSource)
+        EOF
+
+
+
+
+  _provision:artemis:subsystem:init:
+    cmds:
+      - |
+        {{.JBOSS_CLI}} --connect << EOF
+        # https://docs.wildfly.org/26/Admin_Guide.html#Messaging 
+        /extension=org.wildfly.extension.messaging-activemq:add
+        /subsystem=messaging-activemq:add
+        :reload
+        EOF
+
+  _provision:artemis:subsystem:ee:ejb3:naming:
+    vars:
+      ARTEMIS_HOST_URL: tcp://localhost:61616
+    cmds:
+      - |
+        # use << 'EOF' to quote content, as we need variable with leading dollar sign (${ejb.resource-adapter-name:activemq-ra.rar})
+        {{.JBOSS_CLI}} --connect << 'EOF'
+
+        /subsystem=ee/service=default-bindings:write-attribute(name=jms-connection-factory, value=java:jboss/DefaultJMSConnectionFactory)
+        # https://docs.wildfly.org/19/wildscribe/subsystem/ee/index.html
+        # Flag indicating whether Jakarta EE annotations will have property replacements applied
+        # Für MDBs ${propertyName:defaultValue}
+        /subsystem=ee/:write-attribute(name=annotation-property-replacement, value=true)
+
+        # http://www.mastertheboss.com/jboss-frameworks/ironjacamar/how-to-use-a-resource-adapter-in-your-mdb/
+        /subsystem=ejb3:write-attribute(name=default-resource-adapter-name, value="${ejb.resource-adapter-name:activemq-ra.rar}")
+        /subsystem=ejb3:write-attribute(name=default-mdb-instance-pool, value=mdb-strict-max-pool)
+
+        /subsystem=naming/binding="java:global/federation/artemis":add(binding-type=external-context, module=org.apache.activemq.artemis, class=javax.naming.InitialContext, environment=[java.naming.factory.initial=org.apache.activemq.artemis.jndi.ActiveMQInitialContextFactory, java.naming.provider.url="{{.ARTEMIS_HOST_URL}}"])
+        EOF
+
+  _provision:artemis:subsystem:local:
+    cmds:
+      - |
+        {{.JBOSS_CLI}} --connect << EOF
+        /subsystem=messaging-activemq/server=default:add(security-domain=ApplicationDomain,security-enabled=false)
+        /subsystem=messaging-activemq/server=default/security-setting=#:add()
+        /subsystem=messaging-activemq/server=default/security-setting=#/role=guest:add(send=true,consume=true,create-non-durable-queue=true,delete-non-durable-queue=true)
+        /subsystem=messaging-activemq/server=default/address-setting=#:add(dead-letter-address=jms.queue.DLQ,expiry-address=jms.queue.ExpiryQueue,max-size-bytes=10485760,page-size-bytes=2097152,message-counter-history-day-limit=10)
+        /subsystem=messaging-activemq/server=default/http-connector=http-connector:add(socket-binding=http,endpoint=http-acceptor)
+        /subsystem=messaging-activemq/server=default/in-vm-connector=in-vm:add(server-id=0,params={buffer-pooling=false})
+        /subsystem=messaging-activemq/server=default/http-acceptor=http-acceptor:add(http-listener=default)
+        /subsystem=messaging-activemq/server=default/in-vm-acceptor=in-vm:add(server-id=0,params={buffer-pooling=false})
+        /subsystem=messaging-activemq/server=default/jms-queue=ExpiryQueue:add(entries=["java:/jms/queue/ExpiryQueue"])
+        /subsystem=messaging-activemq/server=default/jms-queue=DLQ:add(entries=["java:/jms/queue/DLQ"])
+        /subsystem=messaging-activemq/server=default/connection-factory=InVmConnectionFactory:add(entries=["java:/ConnectionFactory"],connectors=[in-vm])
+        /subsystem=messaging-activemq/server=default/pooled-connection-factory=activemq-ra:add(entries=["java:/JmsXA","java:jboss/DefaultJMSConnectionFactory"],connectors=[in-vm],transaction="ha")
+        :reload
+        EOF
+
+
+
+
+  _configure:logging:
+    cmds:
+      - |
+        {{.JBOSS_CLI}} --connect << EOF
+        /subsystem=logging/root-logger=ROOT:read-resource()
+        /subsystem=logging/root-logger=ROOT:write-attribute(name=level,value=DEBUG)
+
+        /subsystem=logging/console-handler=CONSOLE:read-resource
+        /subsystem=logging/console-handler=CONSOLE:write-attribute(name=level,value=DEBUG)
+        EOF
+
+  _wildfly:add-datasource:
+    vars:
+      DATASOURCE: "{{.DATASOURCE}}"
+      DATABASE: "{{.DATABASE}}"
+      DB_HOST: localhost # host.docker.internal
+      DB_URL: jdbc:postgresql://{{.DB_HOST}}:5432
+    cmds:
+      - '{{.JBOSS_CLI}} --connect --command="data-source add --name={{.DATASOURCE}} --jndi-name=java:/datasources/{{.DATASOURCE}} --driver-name=postgres --connection-url={{.DB_URL}}/{{.DATABASE}} --user-name={{.DATABASE}} --password={{.DATABASE}}"'
+
+  _configure:datasources:
+    cmds:
+      - task: _wildfly:add-datasource
+        vars:
+          DATASOURCE: HibernateQuickstartDS
+          DATABASE: hibernatedemodb
+
+
+
+
+  wildfly:cli:
+    desc: Connect with jboss-cli
+    cmds:
+      - "{{.JBOSS_CLI}} --connect"
+    interactive: true
+  
+  wildfly:cli-with-args:
+    desc: |-
+      Connect with jboss-cli and execute command.
+        $ task {{.TASK}} -- --command="ls /deployment"
+    cmds:
+      - "{{.JBOSS_CLI}} --connect {{.CLI_ARGS}}"
+    interactive: true
+
+  wildfly:deployments:
+    desc: List deployments
+    cmds:
+      - '{{.JBOSS_CLI}} --connect --command="ls /deployment"'
+
+  wildfly:deployment-status:
+    desc: Show status of deployments
+    cmds:
+      - |
+        # use << 'EOF' to quote content, as we need variable with leading dollar sign ($deployed)
+        {{.JBOSS_CLI}} --connect << 'EOF'
+        for deployed in :read-children-names(child-type=deployment)
+          echo $deployed Manifest content
+          attachment display --operation=/deployment=$deployed:read-content(path=META-INF/MANIFEST.MF)
+          echo deployment-info for $deployed
+          deployment-info --name=$deployed
+        done
+        EOF
+
+  wildfly:reload:
+    desc: Reload wildfly
+    cmds:
+      - |
+        {{.JBOSS_CLI}} --connect << EOF
+        echo "wildfly product info"
+        :product-info()
+        echo "wildfly server state"
+        :read-attribute(name=server-state)
+        echo "reload wildfly"
+        :reload()
+        EOF
